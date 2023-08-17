@@ -6,9 +6,8 @@ import (
 	sensor "github.com/instana/go-sensor"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/log"
-	"go.unistack.org/micro/v4/metadata"
-	"go.unistack.org/micro/v4/options"
-	"go.unistack.org/micro/v4/tracer"
+	"go.unistack.org/micro/v3/metadata"
+	"go.unistack.org/micro/v3/tracer"
 )
 
 var _ tracer.Tracer = &Tracer{}
@@ -26,7 +25,7 @@ func (ot *Tracer) Flush(ctx context.Context) error {
 	return nil
 }
 
-func (ot *Tracer) Init(opts ...options.Option) error {
+func (ot *Tracer) Init(opts ...tracer.Option) error {
 	for _, o := range opts {
 		o(&ot.opts)
 	}
@@ -41,7 +40,7 @@ func (ot *Tracer) Init(opts ...options.Option) error {
 	return nil
 }
 
-func (ot *Tracer) Start(ctx context.Context, name string, opts ...options.Option) (context.Context, tracer.Span) {
+func (ot *Tracer) Start(ctx context.Context, name string, opts ...tracer.SpanOption) (context.Context, tracer.Span) {
 	options := tracer.NewSpanOptions(opts...)
 	var span opentracing.Span
 	switch options.Kind {
@@ -81,14 +80,14 @@ func (os *otSpan) Tracer() tracer.Tracer {
 	return &Tracer{sensor: os.sensor, opts: os.topts}
 }
 
-func (os *otSpan) Finish(opts ...options.Option) {
+func (os *otSpan) Finish(opts ...tracer.SpanOption) {
 	if len(os.opts.Labels) > 0 {
 		os.span.LogKV(os.opts.Labels...)
 	}
 	os.span.Finish()
 }
 
-func (os *otSpan) AddEvent(name string, opts ...options.Option) {
+func (os *otSpan) AddEvent(name string, opts ...tracer.EventOption) {
 	os.span.LogFields(log.Event(name))
 }
 
@@ -112,7 +111,7 @@ func (os *otSpan) AddLabels(labels ...interface{}) {
 	os.opts.Labels = append(os.opts.Labels, labels...)
 }
 
-func NewTracer(opts ...options.Option) *Tracer {
+func NewTracer(opts ...tracer.Option) *Tracer {
 	options := tracer.NewOptions(opts...)
 	return &Tracer{opts: options}
 }

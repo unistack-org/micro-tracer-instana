@@ -1,11 +1,11 @@
-module go.unistack.org/micro-tracer-instana/v4
+module go.unistack.org/micro-tracer-instana/v3
 
 go 1.20
 
 require (
 	github.com/instana/go-sensor v1.55.2
 	github.com/opentracing/opentracing-go v1.2.0
-	go.unistack.org/micro/v4 v4.0.7
+	go.unistack.org/micro/v3 v3.10.25
 )
 
 require (
