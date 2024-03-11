@@ -2,65 +2,119 @@ package instana
 
 import (
 	"context"
+	"fmt"
 
+	instana "github.com/instana/go-sensor"
 	sensor "github.com/instana/go-sensor"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/log"
 	"go.unistack.org/micro/v3/metadata"
 	"go.unistack.org/micro/v3/tracer"
+	rutil "go.unistack.org/micro/v3/util/reflect"
 )
 
-var _ tracer.Tracer = &Tracer{}
+var _ tracer.Tracer = (*Tracer)(nil)
 
 type Tracer struct {
 	opts   tracer.Options
 	sensor sensor.Tracer
 }
 
-func (ot *Tracer) Name() string {
-	return ot.opts.Name
+func (t *Tracer) Name() string {
+	return t.opts.Name
 }
 
-func (ot *Tracer) Flush(ctx context.Context) error {
+func (t *Tracer) Flush(ctx context.Context) error {
+	sensor.ShutdownSensor()
 	return nil
 }
 
-func (ot *Tracer) Init(opts ...tracer.Option) error {
+func (t *Tracer) Init(opts ...tracer.Option) error {
 	for _, o := range opts {
-		o(&ot.opts)
+		o(&t.opts)
 	}
 
 	sensorOptions := sensor.DefaultOptions()
-	if v, ok := ot.opts.Context.Value(tracerOptionsKey{}).(*sensor.Options); ok && v != nil {
+	if v, ok := t.opts.Context.Value(tracerOptionsKey{}).(*sensor.Options); ok && v != nil {
 		sensorOptions = v
 	}
 
-	ot.sensor = sensor.NewSensorWithTracer(sensor.NewTracerWithOptions(sensorOptions))
+	if sensorOptions.Service == "" {
+		sensorOptions.Service = "micro"
+	}
 
+	var recorder instana.SpanRecorder
+	recorder = &sensor.Recorder{}
+	if v, ok := t.opts.Context.Value(recorderKey{}).(sensor.SpanRecorder); ok && v != nil {
+		recorder = v
+	}
+
+	t.sensor = sensor.NewSensorWithTracer(sensor.NewTracerWithEverything(sensorOptions, recorder))
+
+	sensor.StartMetrics(sensorOptions)
 	return nil
 }
 
-func (ot *Tracer) Start(ctx context.Context, name string, opts ...tracer.SpanOption) (context.Context, tracer.Span) {
+type idStringer struct {
+	s string
+}
+
+func (s idStringer) String() string {
+	return s.s
+}
+
+type spanContext interface {
+	TraceID() idStringer
+	SpanID() idStringer
+}
+
+func (t *Tracer) Start(ctx context.Context, name string, opts ...tracer.SpanOption) (context.Context, tracer.Span) {
 	options := tracer.NewSpanOptions(opts...)
 	var span opentracing.Span
 	switch options.Kind {
 	case tracer.SpanKindInternal, tracer.SpanKindUnspecified:
-		ctx, span = ot.startSpanFromContext(ctx, name)
+		ctx, span = t.startSpanFromContext(ctx, name)
 	case tracer.SpanKindClient, tracer.SpanKindProducer:
-		ctx, span = ot.startSpanFromOutgoingContext(ctx, name)
+		ctx, span = t.startSpanFromOutgoingContext(ctx, name)
 	case tracer.SpanKindServer, tracer.SpanKindConsumer:
-		ctx, span = ot.startSpanFromIncomingContext(ctx, name)
+		ctx, span = t.startSpanFromIncomingContext(ctx, name)
 	}
-	return ctx, &otSpan{span: span, opts: options}
+
+	sp := &otSpan{topts: t.opts, span: span, opts: options, sensor: t.sensor, status: tracer.SpanStatusOK}
+
+	spctx := span.Context()
+	if v, ok := spctx.(spanContext); ok {
+		sp.traceID = v.TraceID().String()
+		sp.spanID = v.SpanID().String()
+	} else {
+		if val, err := rutil.StructFieldByName(spctx, "TraceID"); err == nil {
+			sp.traceID = fmt.Sprintf("%v", val)
+		}
+		if val, err := rutil.StructFieldByName(spctx, "SpanID"); err == nil {
+			sp.spanID = fmt.Sprintf("%v", val)
+		}
+	}
+
+	return ctx, sp
 }
 
 type otSpan struct {
 	span      opentracing.Span
+	spanID    string
+	traceID   string
 	sensor    sensor.Tracer
 	topts     tracer.Options
 	opts      tracer.SpanOptions
 	status    tracer.SpanStatus
 	statusMsg string
+}
+
+func (os *otSpan) TraceID() string {
+	return os.traceID
+}
+
+func (os *otSpan) SpanID() string {
+	return os.spanID
 }
 
 func (os *otSpan) SetStatus(st tracer.SpanStatus, msg string) {
@@ -80,10 +134,37 @@ func (os *otSpan) Tracer() tracer.Tracer {
 	return &Tracer{sensor: os.sensor, opts: os.topts}
 }
 
+func (os *otSpan) AddLogs(kv ...interface{}) {
+	os.span.LogKV(kv...)
+}
+
 func (os *otSpan) Finish(opts ...tracer.SpanOption) {
-	if len(os.opts.Labels) > 0 {
-		os.span.LogKV(os.opts.Labels...)
+	if len(os.opts.Labels)%2 != 0 {
+		os.opts.Labels = os.opts.Labels[:len(os.opts.Labels)-1]
 	}
+	os.opts.Labels = tracer.UniqLabels(os.opts.Labels)
+	for idx := 0; idx < len(os.opts.Labels); idx += 2 {
+		switch os.opts.Labels[idx] {
+		case "err":
+			os.status = tracer.SpanStatusError
+			os.statusMsg = fmt.Sprintf("%v", os.opts.Labels[idx+1])
+		case "error":
+			continue
+		case "X-Request-Id", "x-request-id":
+			os.span.SetTag("x-request-id", os.opts.Labels[idx+1])
+		case "rpc.call", "rpc.call_type", "rpc.flavor", "rpc.service", "rpc.method",
+			"sdk.database", "db.statement", "db.args", "db.query", "db.method",
+			"messaging.destination.name", "messaging.source.name", "messaging.operation":
+			os.span.SetTag(fmt.Sprintf("%v", os.opts.Labels[idx]), os.opts.Labels[idx+1])
+		default:
+			os.span.LogKV(os.opts.Labels[idx], os.opts.Labels[idx+1])
+		}
+	}
+	if os.status == tracer.SpanStatusError {
+		os.span.SetTag("error", true)
+		os.span.LogKV("error", os.statusMsg)
+	}
+	os.span.SetTag("span.kind", os.opts.Kind)
 	os.span.Finish()
 }
 
@@ -120,14 +201,34 @@ func spanFromContext(ctx context.Context) (opentracing.Span, bool) {
 	return sensor.SpanFromContext(ctx)
 }
 
-func (ot *Tracer) startSpanFromContext(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
+func (t *Tracer) startSpanFromAny(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
+	if tracerSpan, ok := tracer.SpanFromContext(ctx); ok && tracerSpan != nil {
+		return t.startSpanFromContext(ctx, name, opts...)
+	}
+
+	if otSpan := opentracing.SpanFromContext(ctx); otSpan != nil {
+		return t.startSpanFromContext(ctx, name, opts...)
+	}
+
+	if md, ok := metadata.FromIncomingContext(ctx); ok && md != nil {
+		return t.startSpanFromIncomingContext(ctx, name, opts...)
+	}
+
+	if md, ok := metadata.FromOutgoingContext(ctx); ok && md != nil {
+		return t.startSpanFromOutgoingContext(ctx, name, opts...)
+	}
+
+	return t.startSpanFromContext(ctx, name, opts...)
+}
+
+func (t *Tracer) startSpanFromContext(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
 	if parentSpan := opentracing.SpanFromContext(ctx); parentSpan != nil {
 		opts = append(opts, opentracing.ChildOf(parentSpan.Context()))
 	}
 
 	md := metadata.New(1)
 
-	sp := ot.sensor.StartSpan(name, opts...)
+	sp := t.sensor.StartSpan(name, opts...)
 	if err := sp.Tracer().Inject(sp.Context(), opentracing.TextMap, opentracing.TextMapCarrier(md)); err != nil {
 		return nil, nil
 	}
@@ -137,12 +238,12 @@ func (ot *Tracer) startSpanFromContext(ctx context.Context, name string, opts ..
 	return ctx, sp
 }
 
-func (ot *Tracer) startSpanFromOutgoingContext(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
+func (t *Tracer) startSpanFromOutgoingContext(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
 	var parentCtx opentracing.SpanContext
 
 	md, ok := metadata.FromOutgoingContext(ctx)
 	if ok && md != nil {
-		if spanCtx, err := ot.sensor.Extract(opentracing.TextMap, opentracing.TextMapCarrier(md)); err == nil && ok {
+		if spanCtx, err := t.sensor.Extract(opentracing.TextMap, opentracing.TextMapCarrier(md)); err == nil && ok {
 			parentCtx = spanCtx
 		}
 	}
@@ -153,7 +254,7 @@ func (ot *Tracer) startSpanFromOutgoingContext(ctx context.Context, name string,
 
 	nmd := metadata.Copy(md)
 
-	sp := ot.sensor.StartSpan(name, opts...)
+	sp := t.sensor.StartSpan(name, opts...)
 	if err := sp.Tracer().Inject(sp.Context(), opentracing.TextMap, opentracing.TextMapCarrier(nmd)); err != nil {
 		return nil, nil
 	}
@@ -163,12 +264,12 @@ func (ot *Tracer) startSpanFromOutgoingContext(ctx context.Context, name string,
 	return ctx, sp
 }
 
-func (ot *Tracer) startSpanFromIncomingContext(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
+func (t *Tracer) startSpanFromIncomingContext(ctx context.Context, name string, opts ...opentracing.StartSpanOption) (context.Context, opentracing.Span) {
 	var parentCtx opentracing.SpanContext
 
 	md, ok := metadata.FromIncomingContext(ctx)
 	if ok && md != nil {
-		if spanCtx, err := ot.sensor.Extract(opentracing.TextMap, opentracing.TextMapCarrier(md)); err == nil {
+		if spanCtx, err := t.sensor.Extract(opentracing.TextMap, opentracing.TextMapCarrier(md)); err == nil {
 			parentCtx = spanCtx
 		}
 	}
@@ -179,7 +280,8 @@ func (ot *Tracer) startSpanFromIncomingContext(ctx context.Context, name string,
 
 	nmd := metadata.Copy(md)
 
-	sp := ot.sensor.StartSpan(name, opts...)
+	sp := t.sensor.StartSpan(name, opts...)
+	// fmt.Printf("StartSpan %#+v\n", sp)
 	if err := sp.Tracer().Inject(sp.Context(), opentracing.TextMap, opentracing.TextMapCarrier(nmd)); err != nil {
 		return nil, nil
 	}
