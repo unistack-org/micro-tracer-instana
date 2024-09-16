@@ -11,6 +11,7 @@ import (
 	"go.unistack.org/micro/v3/metadata"
 	"go.unistack.org/micro/v3/tracer"
 	rutil "go.unistack.org/micro/v3/util/reflect"
+	"go.unistack.org/micro/v3/util/sort"
 )
 
 var _ tracer.Tracer = (*Tracer)(nil)
@@ -142,7 +143,7 @@ func (os *otSpan) Finish(opts ...tracer.SpanOption) {
 	if len(os.opts.Labels)%2 != 0 {
 		os.opts.Labels = os.opts.Labels[:len(os.opts.Labels)-1]
 	}
-	os.opts.Labels = tracer.UniqLabels(os.opts.Labels)
+	os.opts.Labels = sort.Uniq(os.opts.Labels)
 	for idx := 0; idx < len(os.opts.Labels); idx += 2 {
 		switch os.opts.Labels[idx] {
 		case "err":
